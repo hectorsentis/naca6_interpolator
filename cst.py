@@ -1,31 +1,25 @@
-"""TH-X01: generar NACA 6-series y ajustar CST en un único CSV.
+"""TH-X01: CST de camber y semiespesor normal en la cuerda nominal NACA.
 
-    python cst.py 63-412 --order 5 --points 150
-    python cst.py 632215 --distribution lineal --a 0.8
+    python cst.py 63-412 --order-camber 5 --order-thickness 5 --points 150 --plot
 
-Dependencia: numpy; --plot requiere matplotlib y muestra una figura sin guardarla.
-No necesita scipy ni genera JSON o temporales.
-Resultado: output/NACA_<designación>_CST.csv, junto a este script.
+Dependencias: numpy; matplotlib sólo para --plot. Un único CSV persistente:
+output/NACA_<perfil>_CST.csv. El plot se muestra, no se guarda.
 
-Convención para SpaceClaim/ANSYS (x e y normalizados por cuerda):
-    y(x) = x**0.5 * (1-x) * sum(A[i] * B[i,n](x), i=0..n)
-    B[i,n](x) = comb(n,i) * x**i * (1-x)**(n-i)
-AU y AL se utilizan con su signo, sin negar AL al reconstruir el intradós.
-El modelo impone y(0)=y(1)=0; no incorpora un término de espesor de salida.
-Referencia CST: B. M. Kulfan, doi:10.2514/1.29958.
+Camber: yc=xi*(1-xi)*sum(Ci*B_i,n(xi)); clase (1,1).
+Espesor normal: t=sqrt(xi)*(1-xi)*sum(Ti*B_i,n(xi)); clase (0.5,1).
+t significa SEMIESPESOR, igual que _thickness_at de naca6.py; no espesor total.
+La clase camber (1,1) impone extremos nulos sin imponer una nariz redondeada
+a la línea media. La línea media NACA tiene términos logarítmicos; un CST
+polinómico finito no reproduce exactamente sus pendientes en los bordes.
+Se usan derivadas analíticas CST, nunca diferencias finitas ni splines de
+ajuste. En los extremos se adopta pendiente cero, como _mean_line de NACA;
+la geometría no depende de esa convención porque allí yc=t=0.
 
-El generador NACA devuelve abscisas upper/lower distintas por la composición
-normal del espesor. Por defecto se evalúa un contorno denso, se localiza
-el punto más alejado del borde de salida, y se traslada, rota y normaliza
-su cuerda geométrica. Esto conserva el contorno sin recortar la nariz.
-El marco y su transformación inversa se documentan en el CSV para CAD.
-Se remuestrea LINEALMENTE en una x común con la distribución solicitada.
---frame nominal reproduce el marco anterior, que recorta puntos x<0.
-Los errores se calculan frente al NACA remuestreado que aparece en el CSV,
-en las estaciones elegidas. Las estadísticas no tienen ponderación; el
-ajuste prioriza el primer 2% de cuerda con peso cuadrático 10 por defecto.
-El objetivo LE de 1e-5 se comprueba, no se garantiza para todo orden/perfil.
-Los splines propios del generador NACA no se usan para ajustar el CST.
+theta=atan(dyc/dxi); xu=xi-t*sin(theta); yu=yc+t*cos(theta);
+xl=xi+t*sin(theta); yl=yc-t*cos(theta). Sin rotaciones ni clipping de xu/xl.
+LE nominal=(0,0), TE nominal=(1,0), alpha=0 referido al eje x original.
+Para CAD, escalar todas las coordenadas por la cuerda dimensional deseada.
+Referencia de la representación CST: B. M. Kulfan, doi:10.2514/1.29958.
 """
 
 from __future__ import annotations
@@ -38,210 +32,220 @@ from pathlib import Path
 import re
 import sys
 
-# La ejecución no debe crear archivos auxiliares __pycache__ al importar NACA.
 sys.dont_write_bytecode = True
-
 try:
     import numpy as np
 except ImportError as exc:
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
-    raise SystemExit("Falta numpy. Instálalo con: python -m pip install numpy") from exc
+    raise SystemExit("Falta numpy: python -m pip install numpy") from exc
 
-from naca6 import naca6
+from naca6 import _parse, _mean_line, _thickness_splines, _thickness_at
 
-N1 = 0.5
-N2 = 1.0
+CAMBER_N1, CAMBER_N2 = 0.9, 0.8
+THICKNESS_N1, THICKNESS_N2 = 0.5, 0.8
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-COLUMNS = ("x", "yu_naca", "yl_naca", "yu_cst", "yl_cst", "error_upper", "error_lower")
+COLUMNS = ("xi", "yc_naca", "t_naca", "yc_cst", "t_cst", "xu_naca", "yu_naca",
+           "xl_naca", "yl_naca", "xu_cst", "yu_cst", "xl_cst", "yl_cst", "error_upper", "error_lower")
 
 
 def _vector(values, name):
     try:
-        vector = np.asarray(values, dtype=float)
-    except (TypeError, ValueError) as exc:
+        result = np.asarray(values, dtype=float)
+    except (ValueError, TypeError) as exc:
         raise ValueError(f"{name} debe contener números reales.") from exc
-    if vector.ndim != 1 or vector.size == 0 or not np.all(np.isfinite(vector)):
+    if result.ndim != 1 or not result.size or not np.isfinite(result).all():
         raise ValueError(f"{name} debe ser un vector no vacío de números finitos.")
-    return vector
+    return result
 
 
-def _x_vector(x):
-    x = _vector(x, "x")
-    if np.any((x < 0) | (x > 1)):
-        raise ValueError("Las coordenadas x deben estar entre 0 y 1.")
-    return x
+def _xi(values):
+    values = _vector(values, "xi")
+    if np.any((values < 0) | (values > 1)):
+        raise ValueError("xi debe estar entre 0 y 1.")
+    return values
 
 
-def _order(order):
-    if isinstance(order, bool) or not isinstance(order, Integral) or order < 0:
+def _order(value):
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
         raise ValueError("El orden CST debe ser un entero >= 0.")
-    return int(order)
+    return int(value)
 
 
-def class_function(x, n1=N1, n2=N2):
-    """C(x) = x**n1 * (1-x)**n2, evaluada en un vector de x."""
-    x = _x_vector(x)
+def class_function(xi, n1=THICKNESS_N1, n2=THICKNESS_N2):
+    """Clase xi**n1 * (1-xi)**n2; ambos exponentes positivos."""
+    xi = _xi(xi)
     if not (math.isfinite(n1) and math.isfinite(n2) and n1 > 0 and n2 > 0):
-        raise ValueError("N1 y N2 deben ser positivos y finitos.")
-    return x**n1 * (1.0 - x)**n2
+        raise ValueError("Los exponentes de clase deben ser positivos y finitos.")
+    return xi**n1 * (1 - xi)**n2
 
 
-def bernstein_basis(x, order):
-    """Matriz (n_puntos, order+1), columnas B0..Bn en ese orden."""
-    x = _x_vector(x)
-    order = _order(order)
-    return np.column_stack([
-        math.comb(order, i) * x**i * (1.0 - x)**(order - i)
-        for i in range(order + 1)
-    ])
+def bernstein_basis(xi, order):
+    """Matriz de Bernstein (n_puntos, order+1), columnas B0..Bn."""
+    xi, order = _xi(xi), _order(order)
+    return np.column_stack([math.comb(order, i) * xi**i * (1-xi)**(order-i)
+                            for i in range(order+1)])
 
 
-def evaluate_cst(x, coefficients, n1=N1, n2=N2):
-    """Reconstruye y(x); usa los coeficientes upper/lower con su signo."""
-    x = _x_vector(x)
-    coefficients = _vector(coefficients, "coefficients")
-    return class_function(x, n1, n2) * (bernstein_basis(x, len(coefficients) - 1) @ coefficients)
+def evaluate_cst(xi, coefficients, n1=THICKNESS_N1, n2=THICKNESS_N2,
+                 *, derivative=False):
+    """Evalúa CST o su derivada analítica. Extremos de derivada: convenio 0.
 
-
-def fit_cst(x, y, order=5, n1=N1, n2=N2, *, le_region=0.02, le_weight=10.0):
-    """Ajuste independiente de una superficie por mínimos cuadrados en y.
-
-    Devuelve order+1 coeficientes A0..An. No divide y por C(x), para
-    evitar singularidades en los bordes y conservar mínimos cuadrados
-    con ponderación local en el borde de ataque. le_weight multiplica el
-    peso del error cuadrático (su raíz multiplica las filas de la matriz).
-    Usa le_weight=1 para mínimos cuadrados sin ponderación.
+    Para camber se deben pasar n1=1,n2=1. Coeficientes C0..Cn o T0..Tn.
     """
-    x, y, order = _x_vector(x), _vector(y, "y"), _order(order)
-    if x.shape != y.shape:
-        raise ValueError("x e y deben tener el mismo número de puntos.")
-    if np.any((x == 0) | (x == 1)) and np.any(np.abs(y[(x == 0) | (x == 1)]) > 1e-12):
-        raise ValueError("Este modelo CST requiere y=0 en los bordes x=0 y x=1.")
-    if np.unique(x[(x > 0) & (x < 1)]).size < order + 1:
-        raise ValueError("Faltan estaciones interiores distintas para el orden CST solicitado.")
-    matrix = class_function(x, n1, n2)[:, None] * bernstein_basis(x, order)
-    if not math.isfinite(le_region) or not 0 < le_region <= 1:
-        raise ValueError("le_region debe estar entre 0 y 1.")
-    if not math.isfinite(le_weight) or le_weight < 1:
-        raise ValueError("le_weight debe ser finito y >= 1.")
-    weights = np.where(x <= le_region, math.sqrt(le_weight), 1.0)
-    coefficients, _, rank, _ = np.linalg.lstsq(matrix * weights[:, None], y * weights, rcond=None)
-    if rank != order + 1 or not np.all(np.isfinite(coefficients)):
-        raise ValueError("El ajuste CST no tiene rango completo; reduce el orden o aumenta los puntos.")
+    xi, coefficients = _xi(xi), _vector(coefficients, "coefficients")
+    order = len(coefficients)-1
+    cls = class_function(xi, n1, n2)
+    shape = bernstein_basis(xi, order) @ coefficients
+    if not derivative:
+        return cls * shape
+    result = np.zeros_like(xi)
+    interior = (xi > 0) & (xi < 1)
+    x = xi[interior]
+    if x.size:
+        shape_prime = (order * (bernstein_basis(x, order-1) @ np.diff(coefficients))
+                       if order else np.zeros_like(x))
+        class_prime = cls[interior] * (n1/x - n2/(1-x))
+        result[interior] = class_prime * shape[interior] + cls[interior] * shape_prime
+    return result
+
+
+def fit_cst(xi, values, order=5, n1=THICKNESS_N1, n2=THICKNESS_N2):
+    """Mínimos cuadrados sin ponderación en las ordenadas, independiente.
+
+    Sin dividir por la clase: extremos no singulares y pesos iguales.
+    """
+    xi, values, order = _xi(xi), _vector(values, "values"), _order(order)
+    if xi.shape != values.shape:
+        raise ValueError("xi y values deben tener el mismo tamaño.")
+    endpoints = (xi == 0) | (xi == 1)
+    if np.any(np.abs(values[endpoints]) > 1e-12):
+        raise ValueError("La clase CST requiere valores nulos en xi=0 y xi=1.")
+    if np.unique(xi[~endpoints]).size < order+1:
+        raise ValueError("Faltan estaciones interiores distintas para este orden.")
+    matrix = class_function(xi, n1, n2)[:, None] * bernstein_basis(xi, order)
+    coefficients, _, rank, _ = np.linalg.lstsq(matrix, values, rcond=None)
+    if rank != order+1 or not np.isfinite(coefficients).all():
+        raise ValueError("El ajuste no tiene rango completo; reduce el orden.")
     return coefficients
 
 
-def calculate_errors(y_naca, y_cst):
-    """Devuelve dict con error firmado CST-NACA, RMS y máximo absoluto."""
-    y_naca, y_cst = _vector(y_naca, "y_naca"), _vector(y_cst, "y_cst")
-    if y_naca.shape != y_cst.shape:
-        raise ValueError("Las superficies comparadas deben tener el mismo número de puntos.")
-    error = y_cst - y_naca
-    return {"error": error, "rms": float(np.sqrt(np.mean(error**2))),
-            "max_abs": float(np.max(np.abs(error)))}
+def reconstruct_surfaces(xi, yc, t, dyc):
+    """Composición normal; devuelve xu,yu,xl,yl sin recortar abscisas."""
+    xi = _xi(xi)
+    yc, t, dyc = (_vector(v, name) for v, name in ((yc, "yc"), (t, "t"), (dyc, "dyc")))
+    if any(v.shape != xi.shape for v in (yc, t, dyc)):
+        raise ValueError("xi, yc, t y dyc deben tener el mismo tamaño.")
+    if np.any(t < 0):
+        raise ValueError("El semiespesor normal no puede ser negativo.")
+    theta = np.arctan(dyc)
+    dx, dy = t * np.sin(theta), t * np.cos(theta)
+    return xi-dx, yc+dy, xi+dx, yc-dy
 
 
 def _profile_name(profile):
-    # Se llama después de que naca6 haya validado la designación.
     digits = re.sub(r"\D", "", str(profile))
-    if len(digits) == 6:
-        return f"{digits[:2]}({digits[2]})-{digits[3:]}"
-    return f"{digits[:2]}-{digits[2:]}"
+    return (f"{digits[:2]}({digits[2]})-{digits[3:]}" if len(digits) == 6
+            else f"{digits[:2]}-{digits[2:]}")
 
 
-def generate_common_coordinates(profile, points=150, distribution="coseno", *, a=1.0,
-                                frame="leading-edge", return_frame=False):
-    """Importa NACA, normaliza el marco y remuestrea en x común.
+def generate_naca_camber_thickness(profile, points=150, distribution="coseno", *, a=1.0):
+    """Obtiene yc, dyc y SEMIESPESOR directamente de los auxiliares NACA.
 
-    Devuelve x, yu_naca, yl_naca. Mantiene el número de puntos y las
-    estaciones de cuerda de la distribución solicitada al generador.
+    Devuelve dict con xi, yc, t, dyc, surfaces y metadatos del caso.
+    No deduce línea media/espesor a partir de las superficies.
     """
-    xu, yu, xl, yl = (np.asarray(v, dtype=float) for v in naca6(profile, points, distribution, a=a))
-    x = (xu + xl) / 2.0
-    x[0], x[-1] = 0.0, 1.0
-
-    def resample(xs, ys):
-        inside = (xs > 0) & (xs < 1)
-        xx = np.concatenate(([0.0], xs[inside], [1.0]))
-        yy = np.concatenate(([0.0], ys[inside], [0.0]))
-        if np.any(np.diff(xx) <= 0):
-            raise ValueError("La superficie NACA no es univaluada en 0<x<1; no admite este ajuste CST.")
-        return np.interp(x, xx, yy)
-
-    metadata = {"frame": frame, "origin": (0.0, 0.0), "chord_vector": (1.0, 0.0)}
-    if frame == "nominal":
-        result = x, resample(xu, yu), resample(xl, yl)
-    elif frame == "leading-edge":
-        # Malla densa sólo para evaluar el contorno NACA, no para ajustar CST.
-        ux, uy, lx, ly = (np.asarray(v) for v in naca6(profile, max(8193, points * 16), "coseno", a=a))
-        contour = np.vstack((np.column_stack((ux, uy))[::-1], np.column_stack((lx, ly))[1:]))
-        # Punto más alejado de TE: tangente perpendicular a la cuerda real.
-        index = int(np.argmax(np.sum((contour - [1.0, 0.0])**2, axis=1)))
-        origin = contour[index]
-        direction = np.array([1.0, 0.0]) - origin
-        chord_squared = float(direction @ direction)
-        translated = contour - origin
-        xx = translated @ direction / chord_squared
-        yy = (direction[0] * translated[:, 1] - direction[1] * translated[:, 0]) / chord_squared
-        upper_x, upper_y = xx[:index + 1][::-1], yy[:index + 1][::-1]
-        lower_x, lower_y = xx[index:], yy[index:]
-        if np.any(np.diff(upper_x) <= 0) or np.any(np.diff(lower_x) <= 0):
-            raise ValueError("El contorno no es univaluado en la cuerda geométrica; prueba --frame nominal.")
-        upper_y, lower_y = np.interp(x, upper_x, upper_y), np.interp(x, lower_x, lower_y)
-        upper_y[[0, -1]], lower_y[[0, -1]] = 0.0, 0.0
-        metadata.update(origin=tuple(origin), chord_vector=tuple(direction))
-        result = x, upper_y, lower_y
-    else:
-        raise ValueError("frame debe ser leading-edge o nominal.")
-    return (*result, metadata) if return_frame else result
+    family, cl, tc = _parse(profile)
+    if isinstance(points, bool) or not isinstance(points, Integral) or points < 3:
+        raise ValueError("points debe ser un entero >= 3.")
+    try:
+        a = float(a)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("a debe estar entre 0 y 1.") from exc
+    if not math.isfinite(a) or not 0 <= a <= 1:
+        raise ValueError("a debe ser finito y estar entre 0 y 1.")
+    u = np.linspace(0, 1, points)
+    distributions = {"lineal": lambda: u, "linear": lambda: u,
+                     "coseno": lambda: (1-np.cos(np.pi*u))/2,
+                     "cosine": lambda: (1-np.cos(np.pi*u))/2,
+                     "seno": lambda: 1-np.cos(np.pi*u/2),
+                     "sine": lambda: 1-np.cos(np.pi*u/2),
+                     "seno_salida": lambda: np.sin(np.pi*u/2),
+                     "sine_te": lambda: np.sin(np.pi*u/2)}
+    try:
+        xi = distributions[distribution.strip().lower()]().copy()
+    except (KeyError, AttributeError) as exc:
+        raise ValueError("Distribución no válida: lineal, coseno, seno o seno_salida.") from exc
+    xi[0], xi[-1] = 0.0, 1.0
+    yc, dyc = np.array([_mean_line(float(x), cl, a) for x in xi]).T
+    sx, sy = _thickness_splines(family, tc)
+    t = np.array([_thickness_at(float(x), sx, sy) for x in xi])
+    return dict(profile=_profile_name(profile), family=family, cl=cl, tc=tc, a=a,
+                distribution=distribution, xi=xi, yc=yc, t=t, dyc=dyc,
+                surfaces=reconstruct_surfaces(xi, yc, t, dyc))
 
 
-def write_combined_csv(path, profile, x, yu_naca, yl_naca, upper_coefficients,
-                       lower_coefficients, *, distribution="coseno", a=1.0,
-                       frame_metadata=None, le_region=0.02, le_weight=10.0):
-    """Escribe el único CSV con metadatos, reconstrucción y errores.
+def _statistics(error):
+    error = _vector(error, "error")
+    return dict(error=error, rms=float(np.sqrt(np.mean(error**2))),
+                max_abs=float(np.max(np.abs(error))))
 
-    Las ordenadas CST y errores se calculan aquí desde los coeficientes,
-    para que el encabezado y las filas representen exactamente el mismo caso.
-    Devuelve (estadísticas_upper, estadísticas_lower).
+
+def calculate_geometric_errors(naca_surfaces, cst_surfaces):
+    """Distancias euclídeas upper/lower en la MISMA estación xi (no firmadas).
+
+    Entradas: tuplas (xu,yu,xl,yl). Devuelve estadísticas upper/lower.
     """
-    x = _x_vector(x)
-    yu_naca, yl_naca = _vector(yu_naca, "yu_naca"), _vector(yl_naca, "yl_naca")
-    au, al = _vector(upper_coefficients, "AU"), _vector(lower_coefficients, "AL")
-    if au.size != al.size or yu_naca.shape != x.shape or yl_naca.shape != x.shape:
-        raise ValueError("Tamaños incompatibles de coordenadas o coeficientes.")
-    if np.any(np.diff(x) <= 0) or x[0] != 0 or x[-1] != 1:
-        raise ValueError("x debe crecer estrictamente de 0 a 1, incluyendo ambos bordes.")
-    yu_cst, yl_cst = evaluate_cst(x, au), evaluate_cst(x, al)
-    upper, lower = calculate_errors(yu_naca, yu_cst), calculate_errors(yl_naca, yl_cst)
-    fmt = lambda values: ", ".join(format(float(v), ".17g") for v in values)
-    comments = [
-        "TH-X01 AIRFOIL CST FIT", f"Profile: NACA {profile}",
-        f"CST order: {au.size - 1}", f"N1: {N1}", f"N2: {N2}",
-        "Upper coefficients: " + fmt(au), "Lower coefficients: " + fmt(al),
-        f"RMS error upper: {upper['rms']:.17g}", f"RMS error lower: {lower['rms']:.17g}",
-        f"Max abs error upper: {upper['max_abs']:.17g}",
-        f"Max abs error lower: {lower['max_abs']:.17g}", f"Number of points: {x.size}",
-        f"Distribution: {distribution}", f"NACA loading a: {a:.17g}",
-        "Coefficient order: A0 through An; use lower coefficients with their signed values",
-        "CST formula: y=x^0.5*(1-x)*sum(Ai*binomial(n,i)*x^i*(1-x)^(n-i))",
-        "Trailing edge term: 0; nominal endpoints (0,0) and (1,0)",
-        "NACA resampling: linear onto common chordwise x; points outside [0,1] excluded",
-        "Errors: CST minus resampled NACA; unweighted statistics on the output stations",
-        "Columns below are normalized by chord",
-    ]
-    metadata = frame_metadata or {"frame": "nominal", "origin": (0.0, 0.0), "chord_vector": (1.0, 0.0)}
-    comments[comments.index("NACA resampling: linear onto common chordwise x; points outside [0,1] excluded")] = (
-        "NACA resampling: dense contour, linear interpolation in geometric chord frame; no nose clipping"
-        if metadata["frame"] == "leading-edge" else "NACA resampling: linear in nominal frame; points outside [0,1] excluded")
-    comments += [f"Coordinate frame: {metadata['frame']}",
-                 "Frame origin in original NACA coordinates: " + fmt(metadata["origin"]),
-                 "Frame chord vector in original NACA coordinates: " + fmt(metadata["chord_vector"]),
-                 "Inverse transform: original_point=origin+x*chord_vector+y*(-chord_vector_y,chord_vector_x)",
-                 f"Leading edge region: 0 <= x <= {le_region:.17g}", f"Leading edge least-squares weight: {le_weight:.17g}",
-                 f"Max abs LE error upper: {np.max(np.abs(upper['error'][x <= le_region])):.17g}",
-                 f"Max abs LE error lower: {np.max(np.abs(lower['error'][x <= le_region])):.17g}"]
+    if len(naca_surfaces) != 4 or len(cst_surfaces) != 4:
+        raise ValueError("Cada geometría debe contener xu,yu,xl,yl.")
+    original = tuple(_vector(v, "NACA") for v in naca_surfaces)
+    fitted = tuple(_vector(v, "CST") for v in cst_surfaces)
+    if any(v.shape != original[0].shape for v in original+fitted):
+        raise ValueError("Las coordenadas deben tener el mismo tamaño.")
+    return dict(upper=_statistics(np.hypot(fitted[0]-original[0], fitted[1]-original[1])),
+                lower=_statistics(np.hypot(fitted[2]-original[2], fitted[3]-original[3])))
+
+
+def build_cst_result(case, camber_coefficients, thickness_coefficients):
+    """Reconstruye desde coeficientes, con derivada analítica de camber."""
+    xi = case["xi"]
+    cc, ct = _vector(camber_coefficients, "C"), _vector(thickness_coefficients, "T")
+    yc = evaluate_cst(xi, cc, CAMBER_N1, CAMBER_N2)
+    dyc = evaluate_cst(xi, cc, CAMBER_N1, CAMBER_N2, derivative=True)
+    t = evaluate_cst(xi, ct, THICKNESS_N1, THICKNESS_N2)
+    surfaces = reconstruct_surfaces(xi, yc, t, dyc)
+    return dict(yc=yc, t=t, dyc=dyc, surfaces=surfaces,
+                camber_coefficients=cc, thickness_coefficients=ct,
+                camber_errors=_statistics(yc-case["yc"]), thickness_errors=_statistics(t-case["t"]),
+                geometric_errors=calculate_geometric_errors(case["surfaces"], surfaces))
+
+
+def write_combined_csv(path, case, camber_coefficients, thickness_coefficients):
+    """Escribe un único CSV de 15 columnas; devuelve la reconstrucción CST."""
+    result = build_cst_result(case, camber_coefficients, thickness_coefficients)
+    fmt = lambda values: ", ".join(f"{v:.17g}" for v in values)
+    comments = ["TH-X01 AIRFOIL CST FIT", f"Profile: NACA {case['profile']}",
+                f"NACA family: {case['family']}", f"Cl design: {case['cl']:.17g}",
+                f"t/c: {case['tc']:.17g}", f"a: {case['a']:.17g}",
+                f"CST camber order: {len(camber_coefficients)-1}",
+                f"CST thickness order: {len(thickness_coefficients)-1}",
+                "Camber coefficients C0..Cn: " + fmt(result["camber_coefficients"]),
+                "Thickness coefficients T0..Tn: " + fmt(result["thickness_coefficients"]),
+                "Camber class N1,N2: 1,1; finite polynomial approximation of logarithmic NACA mean line",
+                "Thickness class N1,N2: 0.5,1; t is NORMAL HALF-THICKNESS",
+                "CST formula: f(xi)=xi^N1*(1-xi)^N2*sum(Ai*binomial(n,i)*xi^i*(1-xi)^(n-i))",
+                "Camber derivative: analytic derivative of class times Bernstein shape",
+                "Normal reconstruction: theta=atan(dyc/dxi); xu=xi-t*sin(theta); yu=yc+t*cos(theta); xl=xi+t*sin(theta); yl=yc-t*cos(theta)",
+                "Nominal chord: LE=(0,0); TE=(1,0); chord axis=x; alpha=0 unchanged; no rotation or clipping",
+                "Endpoint slope convention: 0 as in NACA generator; geometry independent since yc=t=0",
+                "Geometry errors: Euclidean distance between corresponding NACA and CST points at the same xi",
+                "Least squares: independent unweighted fits of camber and half-thickness; no surface fit",
+                f"Number of points: {len(case['xi'])}", f"Distribution: {case['distribution']}"]
+    for label, stats in (("camber", result["camber_errors"]), ("thickness", result["thickness_errors"]),
+                         ("geometry upper", result["geometric_errors"]["upper"]),
+                         ("geometry lower", result["geometric_errors"]["lower"])):
+        comments += [f"RMS error {label}: {stats['rms']:.17g}", f"Max abs error {label}: {stats['max_abs']:.17g}"]
+    comments.append("Columns below are normalized by nominal NACA chord")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
@@ -249,43 +253,39 @@ def write_combined_csv(path, profile, x, yu_naca, yl_naca, upper_coefficients,
             stream.write(f"# {comment}\n")
         writer = csv.writer(stream, lineterminator="\n")
         writer.writerow(COLUMNS)
-        for row in zip(x, yu_naca, yl_naca, yu_cst, yl_cst, upper["error"], lower["error"]):
-            writer.writerow(format(float(v), ".17g") for v in row)
-    return upper, lower
+        arrays = (case["xi"], case["yc"], case["t"], result["yc"], result["t"],
+                  *case["surfaces"], *result["surfaces"],
+                  result["geometric_errors"]["upper"]["error"], result["geometric_errors"]["lower"]["error"])
+        for row in zip(*arrays):
+            writer.writerow(f"{value:.17g}" for value in row)
+    return result
 
 
-def plot_comparison(x, yu, yl, au, al, profile):
-    """Figura interactiva: perfil y barras superpuestas de error por x/c.
-
-    Las barras representan residuos locales, no frecuencias de residuos.
-    No guarda ningún archivo persistente.
-    """
+def plot_comparison(case, result):
+    """Perfil paramétrico, distancias por xi y componentes; no guarda PNG."""
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
-        raise ValueError("Para --plot instala matplotlib: python -m pip install matplotlib") from exc
-    uc, lc = evaluate_cst(x, au), evaluate_cst(x, al)
-    fig, (ax, error_ax) = plt.subplots(2, 1, figsize=(11, 7), sharex=True,
-                                     gridspec_kw={"height_ratios": [2, 1]})
-    ax.scatter(x, yu, s=12, facecolors="none", edgecolors="tab:blue", label="NACA upper")
-    ax.scatter(x, yl, s=12, facecolors="none", edgecolors="tab:orange", label="NACA lower")
-    # Curvas CST densas para que también se vean entre las estaciones.
-    dense_x = (1 - np.cos(np.linspace(0, np.pi, 2001))) / 2
-    ax.plot(dense_x, evaluate_cst(dense_x, au), color="tab:blue", label="CST upper")
-    ax.plot(dense_x, evaluate_cst(dense_x, al), color="tab:orange", label="CST lower")
-    ax.set(ylabel="y/c", title=f"NACA {profile} — ajuste CST de orden {len(au)-1}")
+        raise ValueError("Para --plot: python -m pip install matplotlib") from exc
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9))
+    ax, error_ax, components = axes
+    for geometry, style, label in ((case["surfaces"], "o", "NACA"), (result["surfaces"], "-", "CST")):
+        xu, yu, xl, yl = geometry
+        ax.plot(xu, yu, style, color="tab:blue", markersize=3, label=label+" upper")
+        ax.plot(xl, yl, style, color="tab:orange", markersize=3, label=label+" lower")
+    ax.axhline(0, color="gray", linewidth=0.7)
+    ax.set(xlabel="x/c nominal", ylabel="y/c", title=f"NACA {case['profile']} — CST camber + semiespesor normal")
     ax.set_aspect("equal", adjustable="box")
-    ax.legend(ncol=2)
-    edges = np.r_[0.0, (x[:-1] + x[1:]) / 2, 1.0]
-    for error, color, name in ((uc-yu, "tab:blue", "Error upper"), (lc-yl, "tab:orange", "Error lower")):
-        error_ax.bar(x, error, width=np.diff(edges), alpha=0.5, color=color, label=name)
-    error_ax.axhline(0, color="black", linewidth=0.7)
-    for threshold in (-1e-5, 1e-5):
-        error_ax.axhline(threshold, color="gray", linestyle="--", linewidth=0.8)
-    error_ax.set(xlabel="x/c", ylabel="Error CST − NACA [y/c]", title="Errores superpuestos a lo largo de la cuerda")
-    error_ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-    error_ax.legend()
-    for axis in (ax, error_ax):
+    xi = case["xi"]
+    for side, color in (("upper", "tab:blue"), ("lower", "tab:orange")):
+        error_ax.plot(xi, result["geometric_errors"][side]["error"], color=color, label=side)
+    error_ax.set(xlabel="xi", ylabel="Distancia / c", title="Error geométrico en estaciones correspondientes")
+    for key, label, color in (("yc", "Camber", "tab:green"), ("t", "Semiespesor", "tab:purple")):
+        components.plot(xi, case[key], "o", markersize=3, color=color, label=label+" NACA")
+        components.plot(xi, result[key], "-", color=color, label=label+" CST")
+    components.set(xlabel="xi", ylabel="yc/c, t/c", title="Componentes paramétricas")
+    for axis in axes:
+        axis.legend(ncol=2)
         axis.grid(alpha=0.25)
     fig.tight_layout()
     try:
@@ -298,39 +298,34 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
-    parser = argparse.ArgumentParser(description="TH-X01: NACA 6-series y ajuste CST en un único CSV.")
-    parser.add_argument("profile", help="Perfil NACA, por ejemplo 63-412 o 632215")
-    parser.add_argument("--order", type=int, default=5, help="Orden Bernstein, defecto 5 (6 coeficientes)")
-    parser.add_argument("--points", type=int, default=150, help="Estaciones por superficie, defecto 150")
-    parser.add_argument("--distribution", "--distribucion", default="coseno", help="lineal, coseno, seno o seno_salida")
-    parser.add_argument("--a", type=float, default=1.0, help="Extensión de carga NACA, defecto 1")
-    parser.add_argument("--plot", action="store_true", help="Mostrar comparación y barras de error; no guardar imagen")
-    parser.add_argument("--frame", choices=("leading-edge", "nominal"), default="leading-edge", help="Marco geométrico del borde de ataque (defecto) o marco nominal anterior")
-    parser.add_argument("--le-region", type=float, default=0.02, help="Zona LE en x/c, defecto primer 2%% de cuerda")
-    parser.add_argument("--le-weight", type=float, default=10.0, help="Peso del error cuadrático en LE, defecto 10")
+    parser = argparse.ArgumentParser(description="TH-X01: CST de camber y semiespesor normal NACA en un único CSV.")
+    parser.add_argument("profile", help="Por ejemplo 63-412 o 632215")
+    parser.add_argument("--order-camber", type=int, default=5)
+    parser.add_argument("--order-thickness", type=int, default=5)
+    parser.add_argument("--points", type=int, default=150)
+    parser.add_argument("--distribution", "--distribucion", default="coseno")
+    parser.add_argument("--a", type=float, default=1.0)
+    parser.add_argument("--plot", action="store_true", help="Mostrar comparación sin guardar imágenes")
     args = parser.parse_args(argv)
     try:
-        order = _order(args.order)
-        if args.points < order + 3:
-            raise ValueError("--points debe ser >= --order + 3, contando los dos bordes.")
-        x, yu, yl, frame = generate_common_coordinates(args.profile, args.points, args.distribution, a=args.a, frame=args.frame, return_frame=True)
-        au, al = (fit_cst(x, y, order, le_region=args.le_region, le_weight=args.le_weight) for y in (yu, yl))
-        profile = _profile_name(args.profile)
-        upper, lower = write_combined_csv(OUTPUT_DIR / f"NACA_{profile}_CST.csv", profile,
-                                         x, yu, yl, au, al, distribution=args.distribution, a=args.a,
-                                         frame_metadata=frame, le_region=args.le_region, le_weight=args.le_weight)
+        nc, nt = _order(args.order_camber), _order(args.order_thickness)
+        if args.points < max(nc, nt)+3:
+            raise ValueError("--points debe ser >= máximo de los órdenes + 3.")
+        case = generate_naca_camber_thickness(args.profile, args.points, args.distribution, a=args.a)
+        cc = fit_cst(case["xi"], case["yc"], nc, CAMBER_N1, CAMBER_N2)
+        ct = fit_cst(case["xi"], case["t"], nt, THICKNESS_N1, THICKNESS_N2)
+        result = write_combined_csv(OUTPUT_DIR / f"NACA_{case['profile']}_CST.csv", case, cc, ct)
     except (ValueError, OSError, np.linalg.LinAlgError) as exc:
         parser.error(str(exc))
-    print(f"Perfil: NACA {profile} | orden CST: {order} | puntos: {x.size}")
-    print("AU: " + ", ".join(f"{v:.17g}" for v in au))
-    print("AL: " + ", ".join(f"{v:.17g}" for v in al))
-    print(f"Upper: RMS={upper['rms']:.6e} | error máximo={upper['max_abs']:.6e}")
-    print(f"Lower: RMS={lower['rms']:.6e} | error máximo={lower['max_abs']:.6e}")
-    le_error = max(np.max(np.abs(stats["error"][x <= args.le_region])) for stats in (upper, lower))
-    print(f"LE (x/c <= {args.le_region:g}): error máximo={le_error:.6e}; objetivo 1e-5 {'alcanzado' if le_error <= 1e-5 else 'no alcanzado con este orden'}")
+    print(f"Perfil: NACA {case['profile']} | cuerda nominal | puntos: {args.points}")
+    print("C: " + ", ".join(f"{v:.17g}" for v in cc))
+    print("T: " + ", ".join(f"{v:.17g}" for v in ct))
+    for label, stats in (("Camber", result["camber_errors"]), ("Semiespesor", result["thickness_errors"]),
+                         ("Upper", result["geometric_errors"]["upper"]), ("Lower", result["geometric_errors"]["lower"])):
+        print(f"{label}: RMS={stats['rms']:.6e} | máximo={stats['max_abs']:.6e}")
     if args.plot:
         try:
-            plot_comparison(x, yu, yl, au, al, profile)
+            plot_comparison(case, result)
         except ValueError as exc:
             parser.error(str(exc))
 
